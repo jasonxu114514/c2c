@@ -3,7 +3,6 @@ package main
 import (
         "context"
         "encoding/json"
-        "fmt"
         "io"
         "net"
         "net/http"
@@ -78,7 +77,7 @@ func generateDeviceID() string {
         if hostname == "" {
                 hostname = "unknown"
         }
-        return fmt.Sprintf("%s-%d", hostname, time.Now().Unix())
+        return hostname + "-" + time.Now().Format("20060102150405")
 }
 
 // ------------------ 命令執行 ------------------
@@ -115,9 +114,7 @@ type WSClient struct {
 }
 
 func NewWSClient(deviceID string) *WSClient {
-        return &WSClient{
-                deviceID: deviceID,
-        }
+        return &WSClient{deviceID: deviceID}
 }
 
 func (w *WSClient) connect() error {
@@ -165,7 +162,6 @@ func (w *WSClient) connect() error {
 func (w *WSClient) close() {
         w.mu.Lock()
         defer w.mu.Unlock()
-
         if w.conn != nil && !w.closed {
                 w.conn.Close()
                 w.closed = true
@@ -181,11 +177,9 @@ func (w *WSClient) isClosed() bool {
 func (w *WSClient) sendMessage(msg Message) error {
         w.mu.RLock()
         defer w.mu.RUnlock()
-
         if w.closed || w.conn == nil {
-                return fmt.Errorf("connection closed")
+                return nil
         }
-
         return w.conn.WriteJSON(msg)
 }
 
@@ -298,7 +292,6 @@ func main() {
         downloadScriptsSilently()
 
         deviceID := getDeviceID()
-        fmt.Printf("設備ID: %s\n", deviceID)
 
         manager := NewConnectionManager(deviceID)
 
