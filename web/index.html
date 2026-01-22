@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Command Center</title>
+
+<style>
+:root {
+  --bg: #0b1020;
+  --panel: #11162a;
+  --border: #24304f;
+  --text: #e6e8ef;
+  --muted: #8b93b8;
+  --blue: #4f7cff;
+  --green: #2dd4bf;
+  --red: #f87171;
+  --yellow: #facc15;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+}
+
+/* ========== LOGIN ========== */
+
+#login {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-box {
+  width: 360px;
+  padding: 28px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.login-box h1 {
+  margin: 0 0 16px;
+  text-align: center;
+  font-size: 20px;
+}
+
+.login-box p {
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+
+.login-box input {
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.login-box button {
+  width: 100%;
+  margin-top: 18px;
+  padding: 10px;
+  background: var(--blue);
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+}
+
+.login-box button:hover {
+  opacity: 0.9;
+}
+
+/* ========== APP ========== */
+
+#app {
+  display: none;
+  height: 100vh;
+}
+
+#layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  height: 100%;
+}
+
+/* ========== SIDEBAR ========== */
+
+#sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+#sidebar h2 {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+#clients {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+#clients li {
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+#clients li.online {
+  color: var(--green);
+}
+
+#clients li.offline {
+  color: var(--red);
+}
+
+#clients li.active {
+  background: #0b1020;
+  border-color: var(--border);
+}
+
+/* ========== MAIN ========== */
+
+#main {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+#topbar {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+}
+
+#topbar input {
+  flex: 1;
+  padding: 10px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+#topbar button {
+  padding: 10px 18px;
+  background: var(--blue);
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+}
+
+#topbar button:hover {
+  opacity: 0.9;
+}
+
+#log {
+  flex: 1;
+  padding: 14px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 13px;
+}
+
+.log-info { color: var(--muted); }
+.log-ok { color: var(--green); }
+.log-warn { color: var(--yellow); }
+.log-err { color: var(--red); }
+
+#footer {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+</style>
+</head>
+
+<body>
+
+<!-- ===== LOGIN ===== -->
+
+<div id="login">
+  <div class="login-box">
+    <h1>Command Center</h1>
+    <p>Secure internal control panel</p>
+    <input id="user" placeholder="Username">
+    <input id="pass" type="password" placeholder="Password">
+    <button onclick="login()">Login</button>
+  </div>
+</div>
+
+<!-- ===== APP ===== -->
+
+<div id="app">
+  <div id="layout">
+    <div id="sidebar">
+      <h2>Clients</h2>
+      <ul id="clients"></ul>
+    </div>
+
+    <div id="main">
+      <div id="topbar">
+        <input id="cmd" placeholder="Enter command, press Enter to run">
+        <button onclick="execCmd()">Run</button>
+      </div>
+
+      <div id="log"></div>
+
+      <div id="footer">
+        Target: <span id="currentTarget">ALL</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== STATE ===== */
+
+const loginBox = document.getElementById("login");
+const app = document.getElementById("app");
+const logBox = document.getElementById("log");
+const clientsUL = document.getElementById("clients");
+const currentTarget = document.getElementById("currentTarget");
+
+let target = "ALL";
+let ws;
+
+/* ===== LOG ===== */
+
+function log(msg, cls="log-info") {
+  const div = document.createElement("div");
+  div.className = cls;
+  div.textContent = msg;
+  logBox.appendChild(div);
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+/* ===== LOGIN ===== */
+
+function login() {
+  fetch("/api/login", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ user: user.value, pass: pass.value })
+  }).then(r => {
+    if (r.ok) {
+      loginBox.style.display = "none";
+      app.style.display = "block";
+      connectWS();
+    } else {
+      alert("login failed");
+    }
+  });
+}
+
+/* ===== WEBSOCKET ===== */
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host + "/ws");
+
+  ws.onopen = () => log("[WS] connected");
+  ws.onclose = () => log("[WS] disconnected", "log-warn");
+  ws.onerror = () => log("[WS] error", "log-err");
+
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+
+    if (m.type === "init_clients") {
+      m.data.forEach(id => addClient(id, true));
+    }
+
+    if (m.type === "client_online") {
+      addClient(m.data, true);
+      log("[+] online: " + m.data, "log-ok");
+    }
+
+    if (m.type === "client_offline") {
+      setClientOffline(m.data);
+      log("[-] offline: " + m.data, "log-err");
+    }
+
+    if (m.type === "task_result") {
+      log("[" + m.data.device_id + "] " +
+          (m.data.output || m.data.error),
+          m.data.error ? "log-err" : "log-ok");
+    }
+  };
+}
+
+/* ===== CLIENT LIST ===== */
+
+function addClient(id, online) {
+  let li = document.getElementById("c-" + id);
+  if (!li) {
+    li = document.createElement("li");
+    li.id = "c-" + id;
+    li.textContent = id;
+    li.onclick = () => selectClient(id);
+    clientsUL.appendChild(li);
+  }
+  li.className = online ? "online" : "offline";
+}
+
+function setClientOffline(id) {
+  const li = document.getElementById("c-" + id);
+  if (li) li.className = "offline";
+}
+
+function selectClient(id) {
+  target = id;
+  currentTarget.textContent = id;
+  document.querySelectorAll("#clients li").forEach(li => li.classList.remove("active"));
+  const li = document.getElementById("c-" + id);
+  if (li) li.classList.add("active");
+}
+
+/* ===== COMMAND ===== */
+
+function execCmd() {
+  const c = cmd.value.trim();
+  if (!c) return;
+
+  fetch("/api/exec", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ command: c, target: target })
+  });
+
+  log("> " + c);
+  cmd.value = "";
+}
+
+cmd.addEventListener("keydown", e => {
+  if (e.key === "Enter") execCmd();
+});
+</script>
+
+</body>
+</html>
