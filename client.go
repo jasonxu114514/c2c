@@ -36,63 +36,91 @@ func decode(s string, v any) error {
 }
 
 func getDeviceID() string {
-        const path = "/data/adb/.deviceid"
+	const (
+		dir  = "/data/adb"
+		path = "/data/adb/.deviceid"
+	)
 
-        if b, err := os.ReadFile(path); err == nil {
-                id := strings.TrimSpace(string(b))
-                if id != "" {
-                        return id
-                }
-        }
+	// 1️⃣ 确保目录存在
+	_ = os.MkdirAll(dir, 0700)
 
-        var parts []string
+	// 2️⃣ 已存在则直接读取
+	if b, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(b))
+		if id != "" {
+			return id
+		}
+	}
 
-        if _, err := exec.LookPath("getprop"); err == nil {
-                for _, k := range []string{
-                        "ro.serialno",
-                        "ro.product.model",
-                        "ro.product.manufacturer",
-                        "ro.product.brand",
-                } {
-                        if out, err := exec.Command("getprop", k).Output(); err == nil {
-                                v := strings.TrimSpace(string(out))
-                                if v != "" {
-                                        parts = append(parts, v)
-                                }
-                        }
-                }
-        }
+	var parts []string
 
-        if len(parts) == 0 {
-                if b, err := os.ReadFile("/system/build.prop"); err == nil {
-                        for _, k := range []string{
-                                "ro.serialno",
-                                "ro.product.model",
-                                "ro.product.manufacturer",
-                        } {
-                                for _, line := range strings.Split(string(b), "\n") {
-                                        if strings.HasPrefix(line, k+"=") {
-                                                parts = append(parts, strings.TrimPrefix(line, k+"="))
-                                                break
-                                        }
-                                }
-                        }
-                }
-        }
+	// 3️⃣ Android getprop
+	if _, err := exec.LookPath("getprop"); err == nil {
+		keys := []string{
+			"ro.serialno",
+			"ro.product.model",
+			"ro.product.manufacturer",
+			"ro.product.brand",
+		}
+		for _, k := range keys {
+			if out, err := exec.Command("getprop", k).Output(); err == nil {
+				v := strings.TrimSpace(string(out))
+				if v != "" {
+					parts = append(parts, v)
+				}
+			}
+		}
+	}
 
-        if len(parts) == 0 {
-                return "unknown"
-        }
+	// 4️⃣ MAC 地址
+	if ifs, err := net.Interfaces(); err == nil {
+		for _, iface := range ifs {
+			if iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			if len(iface.HardwareAddr) > 0 {
+				parts = append(parts, iface.HardwareAddr.String())
+			}
+		}
+	}
 
-        raw := strings.Join(parts, "_")
-        sum := md5.Sum([]byte(raw))
-        id := hex.EncodeToString(sum[:])
+	// 5️⃣ 本地 IP
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				ip := ipnet.IP
+				if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+					continue
+				}
+				if ip.To4() != nil {
+					parts = append(parts, ip.String())
+				}
+			}
+		}
+	}
 
-        _ = os.MkdirAll("/data/adb", 0700)
-        _ = os.WriteFile(path, []byte(id), 0600)
+	// 6️⃣ 内核版本 / hostname
+	if b, err := os.ReadFile("/proc/version"); err == nil {
+		parts = append(parts, strings.TrimSpace(string(b)))
+	}
+	if h, err := os.Hostname(); err == nil {
+		parts = append(parts, h)
+	}
 
-        return id
+	// 7️⃣ 如果还是空，兜底
+	if len(parts) == 0 {
+		parts = append(parts, uuid.New().String())
+	}
+
+	// 8️⃣ hash 固化
+	raw := strings.Join(parts, "|")
+	sum := md5.Sum([]byte(raw))
+	id := hex.EncodeToString(sum[:])
+
+	_ = os.WriteFile(path, []byte(id), 0600)
+	return id
 }
+
 
 func heartbeat(w *bufio.Writer) {
         for {
