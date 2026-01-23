@@ -11,6 +11,7 @@ import (
         "os/exec"
         "strings"
         "time"
+        "github.com/google/uuid"
 )
 
 type Message struct {
