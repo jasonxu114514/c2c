@@ -23,6 +23,9 @@ const (
 
 	adminUser = "admin"
 	adminPass = "admin"
+
+	heartbeatTimeout = 15 * time.Second
+	heartbeatCheck   = 5 * time.Second
 )
 
 /* ================= MODEL ================= */
@@ -47,7 +50,7 @@ type Task struct {
 	ID      string `json:"id"`
 	Command string `json:"command"`
 	Target  any    `json:"target"`
-	State   string `json:"state"` // running / done
+	State   string `json:"state"`
 }
 
 /* ================= GLOBAL ================= */
@@ -140,15 +143,18 @@ func handleTCP(conn net.Conn) {
 		LastSeen: time.Now(),
 	}
 
-	// 单 device_id 会话
+	// ---- register client (dedup online) ----
 	clientMu.Lock()
+	_, existed := clients[c.DeviceID]
 	if old, ok := clients[c.DeviceID]; ok {
-		old.Conn.Close()
+		old.Conn.Close() // 静默替换
 	}
 	clients[c.DeviceID] = c
 	clientMu.Unlock()
 
-	broadcast("client_online", c.DeviceID)
+	if !existed {
+		broadcast("client_online", c.DeviceID)
+	}
 
 	// ---- read loop ----
 	for {
@@ -172,27 +178,48 @@ func handleTCP(conn net.Conn) {
 			clientMu.Unlock()
 
 		case "result":
-			// 标记任务完成
 			taskMu.Lock()
 			if t, ok := tasks[msg.TaskID]; ok {
 				t.State = "done"
 			}
 			taskMu.Unlock()
 
-			// 🔥 关键修复：补全 device_id
-			msg.DeviceID = c.DeviceID
+			clientMu.Lock()
+			if cur, ok := clients[c.DeviceID]; ok && cur == c {
+				cur.LastSeen = time.Now()
+			}
+			clientMu.Unlock()
 
+			msg.DeviceID = c.DeviceID
 			broadcast("task_result", msg)
 		}
 	}
 
-	// ---- offline ----
+	// ---- disconnect ----
 	clientMu.Lock()
 	if cur, ok := clients[c.DeviceID]; ok && cur == c {
 		delete(clients, c.DeviceID)
 		broadcast("client_offline", c.DeviceID)
 	}
 	clientMu.Unlock()
+}
+
+/* ================= HEARTBEAT WATCHDOG ================= */
+
+func heartbeatWatcher() {
+	ticker := time.NewTicker(heartbeatCheck)
+	for range ticker.C {
+		now := time.Now()
+		clientMu.Lock()
+		for id, c := range clients {
+			if now.Sub(c.LastSeen) > heartbeatTimeout {
+				c.Conn.Close()
+				delete(clients, id)
+				broadcast("client_offline", id)
+			}
+		}
+		clientMu.Unlock()
+	}
 }
 
 /* ================= WEB ================= */
@@ -216,7 +243,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	wsClients[ws] = true
 	wsClientsMu.Unlock()
 
-	// init clients
 	clientMu.Lock()
 	var cl []string
 	for id := range clients {
@@ -224,16 +250,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	clientMu.Unlock()
 
-	// init tasks
-	taskMu.Lock()
-	var tl []*Task
-	for _, t := range tasks {
-		tl = append(tl, t)
-	}
-	taskMu.Unlock()
-
 	ws.WriteJSON(map[string]any{"type": "init_clients", "data": cl})
-	ws.WriteJSON(map[string]any{"type": "init_tasks", "data": tl})
 
 	for {
 		if _, _, err := ws.ReadMessage(); err != nil {
@@ -303,6 +320,7 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 			for _, v := range t {
 				if v == id {
 					found = true
+					break
 				}
 			}
 			if !found {
@@ -319,14 +337,13 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 		c.Writer.Flush()
 	}
 	clientMu.Unlock()
-
-	broadcast("task_new", task)
 }
 
 /* ================= MAIN ================= */
 
 func main() {
-	// TCP
+	go heartbeatWatcher()
+
 	go func() {
 		ln, err := net.Listen("tcp", tcpAddr)
 		if err != nil {
@@ -339,7 +356,6 @@ func main() {
 		}
 	}()
 
-	// Web
 	http.HandleFunc("/api/login", loginHandler)
 	http.HandleFunc("/api/exec", apiExec)
 	http.HandleFunc("/ws", wsHandler)
