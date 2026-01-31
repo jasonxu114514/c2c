@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,6 @@ const (
 
 	heartbeatTimeout = 15 * time.Second
 	heartbeatCheck   = 5 * time.Second
-	wsSendBuf        = 32
 )
 
 /* ================= MODEL ================= */
@@ -52,54 +52,35 @@ type Task struct {
 	ID      string      `json:"id"`
 	Command string      `json:"command"`
 	Target  interface{} `json:"target"`
-	State   string      `json:"state"`
+	State   string      `json:"state"` // running / done
+}
+
+type CommandRecord struct {
+	Time    time.Time   `json:"time"`
+	Command string      `json:"command"`
+	Target  interface{} `json:"target"`
 }
 
 /* ================= GLOBAL ================= */
 
 var (
 	clients  = map[string]*Client{}
-	clientMu sync.RWMutex
+	clientMu sync.Mutex
 
 	tasks  = map[string]*Task{}
-	taskMu sync.RWMutex
+	taskMu sync.Mutex
 
-	wsClients   = map[*websocket.Conn]chan []byte{}
+	commandHistory []CommandRecord
+	historyMu      sync.Mutex
+
+	wsClients   = map[*websocket.Conn]bool{}
 	wsClientsMu sync.Mutex
 
 	sessions  = map[string]bool{}
-	sessionMu sync.RWMutex
-)
+	sessionMu sync.Mutex
 
-/* ================= LOGGING ================= */
-
-type JSONLogger struct {
-	mu   sync.Mutex
-	file *os.File
-}
-
-func NewJSONLogger(path string) *JSONLogger {
-	_ = os.MkdirAll("log", 0755)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		panic(err)
-	}
-	return &JSONLogger{file: f}
-}
-
-func (l *JSONLogger) Write(m map[string]any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	m["ts"] = time.Now().UTC().Format(time.RFC3339)
-	b, _ := json.Marshal(m)
-	l.file.Write(b)
-	l.file.Write([]byte("\n"))
-}
-
-var (
-	historyLog = NewJSONLogger("log/history.log")
-	taskLog    = NewJSONLogger("log/task.log")
-	netLog     = NewJSONLogger("log/network.log")
+	sysLog *log.Logger
+	cmdLog *log.Logger
 )
 
 /* ================= UTIL ================= */
@@ -108,6 +89,7 @@ func encode(v any) string {
 	b, _ := json.Marshal(v)
 	return base64.StdEncoding.EncodeToString(b)
 }
+
 func decode(s string, v any) error {
 	b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
 	if err != nil {
@@ -116,20 +98,36 @@ func decode(s string, v any) error {
 	return json.Unmarshal(b, v)
 }
 
-/* ================= WS BROADCAST ================= */
-
 func broadcast(event string, data any) {
-	msg := map[string]any{"type": event, "data": data}
+	msg := map[string]any{
+		"type": event,
+		"data": data,
+	}
 	b, _ := json.Marshal(msg)
 
 	wsClientsMu.Lock()
-	for _, ch := range wsClients {
-		select {
-		case ch <- b:
-		default:
-		}
+	for c := range wsClients {
+		_ = c.WriteMessage(websocket.TextMessage, b)
 	}
 	wsClientsMu.Unlock()
+}
+
+/* ================= LOG INIT ================= */
+
+func initLogs() {
+	_ = os.MkdirAll("log", 0755)
+
+	sysFile, _ := os.OpenFile(
+		filepath.Join("log", "system.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644,
+	)
+	cmdFile, _ := os.OpenFile(
+		filepath.Join("log", "command.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644,
+	)
+
+	sysLog = log.New(sysFile, "[SYS] ", log.LstdFlags)
+	cmdLog = log.New(cmdFile, "[CMD] ", log.LstdFlags)
 }
 
 /* ================= AUTH ================= */
@@ -141,13 +139,14 @@ func newSession() string {
 	sessionMu.Unlock()
 	return id
 }
+
 func checkAuth(r *http.Request) bool {
 	c, err := r.Cookie("SESSION")
 	if err != nil {
 		return false
 	}
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
 	return sessions[c.Value]
 }
 
@@ -155,8 +154,16 @@ func checkAuth(r *http.Request) bool {
 
 func handleTCP(conn net.Conn) {
 	defer conn.Close()
+
+	sysLog.Printf(
+		"TCP connect local=%s remote=%s",
+		conn.LocalAddr().String(),
+		conn.RemoteAddr().String(),
+	)
+
 	reader := bufio.NewReader(conn)
 
+	// ---- hello ----
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return
@@ -174,73 +181,64 @@ func handleTCP(conn net.Conn) {
 		LastSeen: time.Now(),
 	}
 
+	// ---- register (dedup online) ----
 	clientMu.Lock()
 	_, existed := clients[c.DeviceID]
 	if old, ok := clients[c.DeviceID]; ok {
-		old.Conn.Close()
+		old.Conn.Close() // 静默替换
 	}
 	clients[c.DeviceID] = c
 	clientMu.Unlock()
 
 	if !existed {
-		netLog.Write(map[string]any{
-			"event":     "client_online",
-			"device_id": c.DeviceID,
-		})
 		broadcast("client_online", c.DeviceID)
 	}
 
+	// ---- read loop ----
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
+
 		var msg Message
 		if decode(line, &msg) != nil {
 			continue
 		}
 
 		switch msg.Type {
+
 		case "ping":
 			clientMu.Lock()
-			if cur := clients[c.DeviceID]; cur == c {
+			if cur, ok := clients[c.DeviceID]; ok && cur == c {
 				cur.LastSeen = time.Now()
 			}
 			clientMu.Unlock()
 
 		case "result":
 			taskMu.Lock()
-			if t := tasks[msg.TaskID]; t != nil {
+			if t, ok := tasks[msg.TaskID]; ok {
 				t.State = "done"
 			}
 			taskMu.Unlock()
 
 			clientMu.Lock()
-			if cur := clients[c.DeviceID]; cur == c {
+			if cur, ok := clients[c.DeviceID]; ok && cur == c {
 				cur.LastSeen = time.Now()
 			}
 			clientMu.Unlock()
-
-			taskLog.Write(map[string]any{
-				"task_id":   msg.TaskID,
-				"device_id": c.DeviceID,
-				"output":    msg.Output,
-				"error":     msg.Error,
-			})
 
 			msg.DeviceID = c.DeviceID
 			broadcast("task_result", msg)
 		}
 	}
 
+	// ---- disconnect ----
 	clientMu.Lock()
-	if cur := clients[c.DeviceID]; cur == c {
+	if cur, ok := clients[c.DeviceID]; ok && cur == c {
 		delete(clients, c.DeviceID)
-		netLog.Write(map[string]any{
-			"event":     "client_offline",
-			"device_id": c.DeviceID,
-		})
 		broadcast("client_offline", c.DeviceID)
+		sysLog.Printf("TCP disconnect device=%s", c.DeviceID)
 	}
 	clientMu.Unlock()
 }
@@ -248,18 +246,15 @@ func handleTCP(conn net.Conn) {
 /* ================= HEARTBEAT ================= */
 
 func heartbeatWatcher() {
-	t := time.NewTicker(heartbeatCheck)
-	for range t.C {
+	ticker := time.NewTicker(heartbeatCheck)
+	for range ticker.C {
 		now := time.Now()
 		clientMu.Lock()
 		for id, c := range clients {
 			if now.Sub(c.LastSeen) > heartbeatTimeout {
+				sysLog.Printf("heartbeat timeout device=%s", id)
 				c.Conn.Close()
 				delete(clients, id)
-				netLog.Write(map[string]any{
-					"event":     "client_timeout",
-					"device_id": id,
-				})
 				broadcast("client_offline", id)
 			}
 		}
@@ -284,31 +279,21 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	send := make(chan []byte, wsSendBuf)
-
 	wsClientsMu.Lock()
-	wsClients[ws] = send
+	wsClients[ws] = true
 	wsClientsMu.Unlock()
 
-	netLog.Write(map[string]any{
-		"event":  "ws_connect",
-		"remote": r.RemoteAddr,
-	})
-
-	go func() {
-		for msg := range send {
-			ws.WriteMessage(websocket.TextMessage, msg)
-		}
-	}()
-
-	clientMu.RLock()
+	clientMu.Lock()
 	var cl []string
 	for id := range clients {
 		cl = append(cl, id)
 	}
-	clientMu.RUnlock()
+	clientMu.Unlock()
 
-	ws.WriteJSON(map[string]any{"type": "init_clients", "data": cl})
+	ws.WriteJSON(map[string]any{
+		"type": "init_clients",
+		"data": cl,
+	})
 
 	for {
 		if _, _, err := ws.ReadMessage(); err != nil {
@@ -319,20 +304,28 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	wsClientsMu.Lock()
 	delete(wsClients, ws)
 	wsClientsMu.Unlock()
-	close(send)
 }
 
 /* ================= API ================= */
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct{ User, Pass string }
+	var req struct {
+		User string `json:"user"`
+		Pass string `json:"pass"`
+	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+
 	if req.User != adminUser || req.Pass != adminPass {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+
+	sid := newSession()
 	http.SetCookie(w, &http.Cookie{
-		Name: "SESSION", Value: newSession(), Path: "/", HttpOnly: true,
+		Name:     "SESSION",
+		Value:    sid,
+		Path:     "/",
+		HttpOnly: true,
 	})
 }
 
@@ -341,77 +334,72 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+
 	var req struct {
 		Command string      `json:"command"`
 		Target  interface{} `json:"target"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	historyLog.Write(map[string]any{
-		"user":    "admin",
-		"command": req.Command,
-		"target":  req.Target,
-	})
+	rec := CommandRecord{
+		Time:    time.Now(),
+		Command: req.Command,
+		Target:  req.Target,
+	}
 
-	id := uuid.New().String()
-	task := &Task{ID: id, Command: req.Command, Target: req.Target, State: "running"}
+	historyMu.Lock()
+	commandHistory = append(commandHistory, rec)
+	historyMu.Unlock()
+
+	cmdLog.Printf("cmd=%q target=%v", req.Command, req.Target)
+
+	taskID := uuid.New().String()
+	task := &Task{
+		ID:      taskID,
+		Command: req.Command,
+		Target:  req.Target,
+		State:   "running",
+	}
+
 	taskMu.Lock()
-	tasks[id] = task
+	tasks[taskID] = task
 	taskMu.Unlock()
 
-	clientMu.RLock()
-	for cid, c := range clients {
-		if req.Target != "ALL" {
-			if list, ok := req.Target.([]any); ok {
-				ok2 := false
-				for _, v := range list {
-					if v == cid {
-						ok2 = true
-					}
-				}
-				if !ok2 {
-					continue
+	clientMu.Lock()
+	for id, c := range clients {
+		switch t := req.Target.(type) {
+		case string:
+			if t != "ALL" && id != t {
+				continue
+			}
+		case []any:
+			found := false
+			for _, v := range t {
+				if v == id {
+					found = true
+					break
 				}
 			}
+			if !found {
+				continue
+			}
 		}
-		c.Writer.WriteString(encode(Message{
-			Type: "task", TaskID: id, Command: req.Command,
-		}) + "\n")
+
+		msg := Message{
+			Type:    "task",
+			TaskID:  taskID,
+			Command: req.Command,
+		}
+		c.Writer.WriteString(encode(msg) + "\n")
 		c.Writer.Flush()
 	}
-	clientMu.RUnlock()
-}
-
-func apiHistory(w http.ResponseWriter, r *http.Request) {
-	if !checkAuth(r) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	f, err := os.Open("log/history.log")
-	if err != nil {
-		json.NewEncoder(w).Encode([]any{})
-		return
-	}
-	defer f.Close()
-
-	var res []map[string]any
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		var m map[string]any
-		if json.Unmarshal(sc.Bytes(), &m) == nil {
-			res = append(res, m)
-		}
-	}
-	if len(res) > 200 {
-		res = res[len(res)-200:]
-	}
-	json.NewEncoder(w).Encode(res)
+	clientMu.Unlock()
 }
 
 /* ================= MAIN ================= */
 
 func main() {
+	initLogs()
 	go heartbeatWatcher()
 
 	go func() {
@@ -419,6 +407,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		sysLog.Println("TCP listen", tcpAddr)
 		for {
 			conn, _ := ln.Accept()
 			go handleTCP(conn)
@@ -427,10 +416,9 @@ func main() {
 
 	http.HandleFunc("/api/login", loginHandler)
 	http.HandleFunc("/api/exec", apiExec)
-	http.HandleFunc("/api/history", apiHistory)
 	http.HandleFunc("/ws", wsHandler)
 	http.Handle("/", http.FileServer(http.Dir("./web")))
 
-	log.Println("server listening")
+	sysLog.Println("Web listen", webAddr)
 	log.Fatal(http.ListenAndServe(webAddr, nil))
 }
