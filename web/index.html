@@ -1,298 +1,54 @@
 <!doctype html>
 <html lang="zh">
 <head>
-<meta charset="utf-8">
-<title>Command Center</title>
-
-<style>
-:root {
-  --bg:#0b1020; --panel:#11162a; --border:#24304f;
-  --text:#e6e8ef; --muted:#8b93b8;
-  --blue:#4f7cff; --green:#2dd4bf; --red:#f87171;
-}
-
-* { box-sizing:border-box; font-family:ui-monospace,Menlo,monospace; }
-body { margin:0; background:var(--bg); color:var(--text); height:100vh; }
-
-/* ===== Login ===== */
-#login {
-  height:100vh; display:flex; align-items:center; justify-content:center;
-}
-.login-box {
-  width:360px; padding:28px; background:var(--panel);
-  border:1px solid var(--border); border-radius:10px;
-}
-.login-box h1 { text-align:center; margin:0 0 12px; }
-.login-box input {
-  width:100%; margin-top:12px; padding:10px;
-  background:transparent; color:var(--text);
-  border:1px solid var(--border); border-radius:6px;
-}
-.login-box button {
-  width:100%; margin-top:16px; padding:10px;
-  background:var(--blue); border:none; border-radius:6px; color:#fff;
-  cursor:pointer;
-}
-
-/* ===== App ===== */
-#app { display:none; height:100vh; }
-#layout { display:grid; grid-template-columns:280px 1fr; height:100%; }
-
-/* ===== Sidebar ===== */
-#sidebar {
-  background:var(--panel); border-right:1px solid var(--border);
-  padding:12px; display:flex; flex-direction:column;
-}
-#sidebar h3 { margin:6px 0; font-size:13px; color:var(--muted); }
-
-#client-tools { display:flex; gap:6px; margin-bottom:8px; }
-#client-tools button {
-  flex:1; padding:4px; font-size:12px;
-  background:#1b2345; border:1px solid var(--border); color:var(--text);
-  cursor:pointer;
-}
-
-#clients {
-  list-style:none; padding:0; margin:0; overflow-y:auto; flex:1;
-}
-#clients li {
-  display:flex; align-items:center; gap:6px;
-  padding:6px; margin-bottom:4px;
-  border-radius:6px; cursor:pointer;
-}
-#clients li.online { color:var(--green); }
-#clients li.offline { color:var(--red); }
-
-/* ===== Main ===== */
-#main { display:flex; flex-direction:column; height:100%; }
-#topbar {
-  display:flex; gap:8px; padding:10px;
-  border-bottom:1px solid var(--border);
-}
-#cmd {
-  flex:1; padding:10px; background:transparent;
-  border:1px solid var(--border); color:var(--text);
-}
-#run {
-  padding:10px 18px; background:var(--blue);
-  border:none; color:#fff; cursor:pointer;
-}
-#log {
-  flex:1; padding:12px; overflow-y:auto;
-  white-space:pre-wrap; font-size:13px;
-}
-.log-ok { color:var(--green); }
-.log-err { color:var(--red); }
-.log-info { color:var(--muted); }
-
-#footer {
-  padding:6px 12px; font-size:12px; color:var(--muted);
-  border-top:1px solid var(--border);
-}
-</style>
+  <meta charset="utf-8">
+  <title>Command Center</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
-
 <body>
 
-<!-- ===== Login ===== -->
 <div id="login">
   <div class="login-box">
     <h1>Command Center</h1>
     <input id="user" placeholder="Username">
     <input id="pass" type="password" placeholder="Password">
-    <button onclick="doLogin()">Login</button>
+    <button id="loginBtn">Login</button>
   </div>
 </div>
 
-<!-- ===== App ===== -->
 <div id="app">
   <div id="layout">
-
-    <div id="sidebar">
+    <aside id="sidebar">
       <h3>Clients</h3>
       <div id="client-tools">
-        <button onclick="selectAll(true)">All</button>
-        <button onclick="selectAll(false)">None</button>
+        <button id="selectAll">All</button>
+        <button id="selectNone">None</button>
       </div>
       <ul id="clients"></ul>
-    </div>
+    </aside>
 
-    <div id="main">
+    <main id="main">
       <div id="topbar">
-        <input id="cmd" placeholder="command (↑↓ history)">
-        <button id="run" onclick="execCmd()">Run</button>
+        <input id="cmd" placeholder="command">
+        <button id="runBtn">Run</button>
+        <button id="historyBtn">History</button>
+        <button id="clearLogBtn">Clear</button>
       </div>
-      <div id="log"></div>
-      <div id="footer">
-        Targets: <span id="targets">ALL</span>
-      </div>
-    </div>
 
+      <div id="historyPanel" hidden>
+        <h4>Command History</h4>
+        <div id="historyList"></div>
+      </div>
+
+      <div id="log"></div>
+
+      <footer id="footer">
+        Targets: <span id="targets">ALL</span>
+      </footer>
+    </main>
   </div>
 </div>
 
-<script>
-/* ===== DOM ===== */
-const loginBox   = document.getElementById("login");
-const appBox     = document.getElementById("app");
-const logBox     = document.getElementById("log");
-const clientsUL  = document.getElementById("clients");
-const targetsSpan= document.getElementById("targets");
-const cmdInput   = document.getElementById("cmd");
-
-/* ===== State ===== */
-let ws;
-let reconnectDelay = 1000;
-let selected = new Set();
-
-let history = JSON.parse(localStorage.getItem("cmdHistory") || "[]");
-let hIndex = history.length;
-
-/* ===== Log ===== */
-function addLog(msg, cls="log-info") {
-  const d = document.createElement("div");
-  d.className = cls;
-  d.textContent = msg;
-  logBox.appendChild(d);
-  logBox.scrollTop = logBox.scrollHeight;
-}
-
-/* ===== Login ===== */
-function doLogin() {
-  fetch("/api/login", {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({
-      user: document.getElementById("user").value,
-      pass: document.getElementById("pass").value
-    })
-  }).then(r=>{
-    if(r.ok){
-      loginBox.style.display="none";
-      appBox.style.display="block";
-      connectWS();
-    } else {
-      alert("login failed");
-    }
-  });
-}
-
-/* ===== WebSocket (auto reconnect) ===== */
-function connectWS(){
-  const proto = location.protocol==="https:" ? "wss" : "ws";
-  ws = new WebSocket(proto + "://" + location.host + "/ws");
-
-  ws.onopen = () => {
-    addLog("[WS] connected");
-    reconnectDelay = 1000;
-  };
-
-  ws.onclose = () => {
-    addLog("[WS] disconnected","log-err");
-    setTimeout(connectWS, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
-  };
-
-  ws.onmessage = e => {
-    const m = JSON.parse(e.data);
-
-    if(m.type==="init_clients"){
-      m.data.forEach(id=>addClient(id,true));
-    }
-
-    if(m.type==="client_online"){
-      addClient(m.data,true);
-      addLog("[+] "+m.data,"log-ok");
-    }
-
-    if(m.type==="client_offline"){
-      setOffline(m.data);
-      addLog("[-] "+m.data,"log-err");
-    }
-
-    if(m.type==="task_result"){
-      addLog(
-        "["+m.data.device_id+"] " + (m.data.output||m.data.error),
-        m.data.error ? "log-err" : "log-ok"
-      );
-    }
-  };
-}
-
-/* ===== Clients ===== */
-function addClient(id, online){
-  let li = document.getElementById("c-"+id);
-  if(!li){
-    li = document.createElement("li");
-    li.id = "c-"+id;
-    li.innerHTML = `<input type="checkbox"> <span>${id}</span>`;
-    li.onclick = ()=>toggleClient(id);
-    clientsUL.appendChild(li);
-  }
-  li.className = online ? "online" : "offline";
-}
-
-function setOffline(id){
-  const li = document.getElementById("c-"+id);
-  if(li) li.className="offline";
-}
-
-function toggleClient(id){
-  const cb = document.querySelector("#c-"+id+" input");
-  if(cb.checked){
-    selected.add(id);
-  }else{
-    selected.delete(id);
-  }
-  updateTargets();
-}
-
-function selectAll(on){
-  selected.clear();
-  document.querySelectorAll("#clients li").forEach(li=>{
-    const id = li.id.slice(2);
-    const cb = li.querySelector("input");
-    cb.checked = on;
-    if(on) selected.add(id);
-  });
-  updateTargets();
-}
-
-function updateTargets(){
-  targetsSpan.textContent = selected.size ? [...selected].join(",") : "ALL";
-}
-
-/* ===== Command ===== */
-function execCmd(){
-  const c = cmdInput.value.trim();
-  if(!c) return;
-
-  fetch("/api/exec", {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({
-      command: c,
-      target: selected.size ? [...selected] : "ALL"
-    })
-  });
-
-  addLog("> "+c);
-  history.push(c);
-  localStorage.setItem("cmdHistory", JSON.stringify(history));
-  hIndex = history.length;
-  cmdInput.value="";
-}
-
-cmdInput.addEventListener("keydown",e=>{
-  if(e.key==="Enter") execCmd();
-  if(e.key==="ArrowUp" && hIndex>0){
-    cmdInput.value = history[--hIndex] || "";
-  }
-  if(e.key==="ArrowDown" && hIndex<history.length-1){
-    cmdInput.value = history[++hIndex] || "";
-  }
-});
-</script>
-
+<script src="/app.js"></script>
 </body>
 </html>
